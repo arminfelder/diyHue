@@ -2,7 +2,7 @@ import uuid
 import logManager
 from lights.light_types import lightTypes, archetype
 from lights.protocols import protocols
-from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent
+from HueObjects import genV2Uuid, incProcess, v1StateToV2, generate_unique_id, v2StateToV1, StreamEvent, clampV1State
 from datetime import datetime, timezone
 from copy import deepcopy
 from time import sleep
@@ -152,6 +152,7 @@ class Light():
     def setV1State(self, state, advertise=True):
         if "lights" not in state:
             state = incProcess(self.state, state)
+            clampV1State(state)
             self.updateLightState(state)
             for key, value in state.items():
                 if key in self.state:
@@ -206,26 +207,62 @@ class Light():
         self.genStreamEvent(state)
 
     def genStreamEvent(self, v2State):
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [{"id": self.id_v2,"id_v1": "/lights/" + self.id_v1, "type": "light"}],
-                         "id": str(uuid.uuid4()),
-                         "type": "update"
-                         }
-        streamMessage["data"][0].update(v2State)
-        streamMessage["data"][0].update({"owner": {"rid": self.getDevice()["id"], "rtype": "device"}})
-        streamMessage["data"][0].update({"service_id": self.protocol_cfg["light_nr"]-1 if "light_nr" in self.protocol_cfg else 0})
-        StreamEvent(streamMessage)
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [self.getDevice()],
-                         "id": str(uuid.uuid4()),
-                         "type": "update"
-                         }
-        StreamEvent(streamMessage)
+        # Spec: a single light change is emitted as ONE batched event whose
+        # data[] carries the light delta, its device, and the cascaded
+        # grouped_light rollups (every owning room/zone + bridge_home/group 0).
+        lightDelta = {"id": self.id_v2, "id_v1": "/lights/" + self.id_v1, "type": "light"}
+        lightDelta.update(v2State)
+        lightDelta["owner"] = {"rid": self.getDevice()["id"], "rtype": "device"}
+        lightDelta["service_id"] = self.protocol_cfg["light_nr"] - 1 if "light_nr" in self.protocol_cfg else 0
+        data = [lightDelta, self.getDevice()]
+        data.extend(self._groupedLightRollups(v2State))
+        StreamEvent({"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "data": data,
+                     "id": str(uuid.uuid4()),
+                     "type": "update"})
+
+    def _groupedLightRollups(self, v2State):
+        """grouped_light deltas for the groups owning this light, plus group 0."""
+        rollups = []
+        # Use the already-imported module only — never trigger a fresh import
+        # here (it would re-run argument parsing in some contexts).
+        import sys
+        groups = {}
+        cfgMod = sys.modules.get("configManager")
+        if cfgMod is not None:
+            try:
+                groups = cfgMod.bridgeConfig.yaml_config.get("groups", {})
+            except Exception:
+                groups = {}
+        emittedZero = False
+        for gid, group in groups.items():
+            try:
+                member = any(ref() is self for ref in group.lights)
+            except Exception:
+                member = False
+            if gid == "0" or member:
+                delta = {"id": group.id_v2, "id_v1": "/groups/" + group.id_v1,
+                         "type": "grouped_light"}
+                if "on" in v2State:
+                    delta["on"] = v2State["on"]
+                rollups.append(delta)
+                emittedZero = emittedZero or gid == "0"
+        if not emittedZero:
+            # bridge_home (all-lights) aggregate always reflects a light change.
+            delta = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, "bridge_home_grouped_light")),
+                     "id_v1": "/groups/0", "type": "grouped_light",
+                     "owner": {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, "bridge_home")),
+                               "rtype": "bridge_home"}}
+            if "on" in v2State:
+                delta["on"] = v2State["on"]
+            rollups.append(delta)
+        return rollups
 
     def getDevice(self):
         result = {"id": str(uuid.uuid5(
             uuid.NAMESPACE_URL, self.id_v2 + 'device'))}
         result["id_v1"] = "/lights/" + self.id_v1
+        result["owner"] = {"rid": result["id"], "rtype": "device"}
         result["identify"] = {}
         result["metadata"] = {
             "archetype": archetype[self.config["archetype"]],
@@ -316,7 +353,7 @@ class Light():
                 }
             }
             result["color_temperature"]["mirek_valid"] = True if self.state[
-                "ct"] != None and self.state["ct"] < 500 and self.state["ct"] > 153 else False
+                "ct"] != None and 153 <= self.state["ct"] <= 500 else False
             result["color_temperature_delta"] = {}
         if "bri" in self.state:
             bri_value = self.state["bri"]

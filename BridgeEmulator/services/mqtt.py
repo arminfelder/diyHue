@@ -11,7 +11,7 @@ from threading import Thread
 from time import sleep
 from functions.core import nextFreeId
 from sensors.discover import addHueMotionSensor
-from sensors.sensor_types import sensorTypes
+from sensors.sensor_types import sensorTypes, MODEL_ALIASES
 from lights.discover import addNewLight
 from functions.rules import rulesProcessor
 from functions.behavior_instance import checkBehaviorInstances
@@ -134,9 +134,6 @@ standardSensors = {
     "RDM002": {
         "dataConversion": {
             "rootKey": "action",
-            "dirKey": "action_direction",
-            "typeKey": "action_type",
-            "timeKey": "action_time",
             "button_1_press": {"buttonevent": 1000},
             "button_1_hold": {"buttonevent": 1001},
             "button_1_press_release": {"buttonevent": 1002},
@@ -153,12 +150,17 @@ standardSensors = {
             "button_4_hold": {"buttonevent": 4001},
             "button_4_press_release": {"buttonevent": 4002},
             "button_4_hold_release": {"buttonevent": 4003},
+            # Two streams per detent. dial_rotate_* (proprietary telemetry) is
+            # dropped in on_message; brightness_step_* (standard Level Control,
+            # carries action_step_size) is the canonical dim event.
             "dial_rotate_left_step": {"rotaryevent": 1},
             "dial_rotate_left_slow": {"rotaryevent": 2},
             "dial_rotate_left_fast": {"rotaryevent": 2},
             "dial_rotate_right_step": {"rotaryevent": 1},
             "dial_rotate_right_slow": {"rotaryevent": 2},
             "dial_rotate_right_fast": {"rotaryevent": 2},
+            "brightness_step_up": {"rotaryevent": 1},
+            "brightness_step_down": {"rotaryevent": 1},
             "expectedrotation":90,
             "expectedeventduration":400
         }
@@ -187,12 +189,11 @@ standardSensors = {
 
 # WXKG01LM MiJia wireless switch https://www.zigbee2mqtt.io/devices/WXKG01LM.html
 
-standardSensors["RWL020"] = standardSensors["RWL021"]
-standardSensors["RWL022"] = standardSensors["RWL021"]
-standardSensors["8719514440937"] = standardSensors["RDM002"]
-standardSensors["8719514440999"] = standardSensors["RDM002"]
-standardSensors["9290035001"] = standardSensors["RDM002"]
-standardSensors["9290035003"] = standardSensors["RDM002"]
+# Register the same model aliases used in sensor_types so MQTT auto-discovery
+# resolves action mappings by any alternative model id (single source of truth).
+for _alias, _canonical in MODEL_ALIASES.items():
+    if _canonical in standardSensors:
+        standardSensors[_alias] = standardSensors[_canonical]
 
 
 def getClient():
@@ -295,6 +296,37 @@ def on_state_update(msg):
     logging.debug(json.dumps(data, indent=4))
 
 # on_message handler (linked to client below)
+def getSensorsByIeeeAddr(ieeeAddr):
+    """All mqtt sensors that share a Zigbee ieee address (one physical device)."""
+    result = []
+    for sensor in bridgeConfig["sensors"].values():
+        if getattr(sensor, "protocol", None) == "mqtt" and \
+                sensor.protocol_cfg.get("ieeeAddr") == ieeeAddr:
+            result.append(sensor)
+    return result
+
+
+def renameAndDedupSensors(sensors, friendly_name):
+    """
+    Rename every sensor of a physical device to `friendly_name` and keep only
+    one sensor per type (a renamed Z2M device can otherwise leave stale
+    duplicates registered under the old friendly_name).
+    """
+    byType = {}
+    for sensor in sensors:
+        byType.setdefault(sensor.type, []).append(sensor)
+    for group in byType.values():
+        keeper = next((s for s in group
+                       if s.protocol_cfg.get("friendly_name") == friendly_name), group[0])
+        for sensor in group:
+            if sensor is not keeper:
+                for sid, obj in list(bridgeConfig["sensors"].items()):
+                    if obj is sensor:
+                        del bridgeConfig["sensors"][sid]
+        keeper.name = friendly_name
+        keeper.protocol_cfg["friendly_name"] = friendly_name
+
+
 def on_message(client, userdata, msg):
     if bridgeConfig["config"]["mqtt"]["enabled"]:
         try:
@@ -307,15 +339,28 @@ def on_message(client, userdata, msg):
             elif msg.topic == "zigbee2mqtt/bridge/devices":
                 for key in data:
                     if "model_id" in key and (key["model_id"] in standardSensors or key["model_id"] in motionSensors): # Sensor is supported
-                        if getObject(key["friendly_name"]) == False: ## Add the new sensor
+                        existingByIeee = getSensorsByIeeeAddr(key["ieee_address"]) if "ieee_address" in key else []
+                        if existingByIeee:
+                            # ieee already registered (e.g. user renamed in Z2M):
+                            # rename in place and dedupe rather than adding again.
+                            renameAndDedupSensors(existingByIeee, key["friendly_name"])
+                        elif getObject(key["friendly_name"]) == False: ## Add the new sensor
                             logging.info("MQTT: Add new mqtt sensor " + key["friendly_name"])
                             if key["model_id"] in standardSensors:
+                                switchId = None
                                 for sensor_type in sensorTypes[key["model_id"]].keys():
                                     new_sensor_id = nextFreeId(bridgeConfig, "sensors")
                                     #sensor_type = sensorTypes[key["model_id"]][sensor]
                                     uniqueid = convertHexToMac(key["ieee_address"]) + "-01-1000"
                                     sensorData = {"name": key["friendly_name"], "protocol": "mqtt", "modelid": key["model_id"], "type": sensor_type, "uniqueid": uniqueid,"protocol_cfg": {"friendly_name": key["friendly_name"], "ieeeAddr": key["ieee_address"], "model": key["definition"]["model"]}, "id_v1": new_sensor_id}
-                                    bridgeConfig["sensors"][new_sensor_id] = Sensor.Sensor(sensorData)
+                                    # link the dial to its sibling switch (its
+                                    # automation is configured on the switch device)
+                                    if sensor_type == "ZLLRelativeRotary" and switchId is not None:
+                                        sensorData["parent_id_v2"] = switchId
+                                    sensor = Sensor.Sensor(sensorData)
+                                    bridgeConfig["sensors"][new_sensor_id] = sensor
+                                    if sensor_type == "ZLLSwitch":
+                                        switchId = sensor.id_v2
                             ### TRADFRI Motion Sensor, Xiaomi motion sensor, etc
                             elif key["model_id"] in motionSensors:
                                     logging.info("MQTT: add new motion sensor " + key["model_id"])
@@ -379,16 +424,50 @@ def on_message(client, userdata, msg):
                                 requests.post("https://diyhue.org/cdn/mailNotify.php", json={"to": bridgeConfig["config"]["alarm"]["email"], "sensor": device.name}, timeout=10)
                                 bridgeConfig["config"]["alarm"]["lasttriggered"] = int(current_time.timestamp())
                         elif device.modelid in standardSensors:
-                            convertedPayload.update(standardSensors[device.modelid]["dataConversion"][data[standardSensors[device.modelid]["dataConversion"]["rootKey"]]])
+                            conv = standardSensors[device.modelid]["dataConversion"]
+                            action = data.get(conv["rootKey"])
+                            if action in conv:
+                                convertedPayload.update(conv[action])
+                            # Rotary dial: carry the real direction + magnitude from
+                            # the Hue 0xFC00 frame (Z2M action_direction/action_time)
+                            # instead of dropping them, so dimming can be proportional.
+                            if "rotaryevent" in convertedPayload:
+                                action = data.get("action", "")
+                                # dial_rotate_* is redundant telemetry for the same
+                                # detent; brightness_step_* is the canonical dim event
+                                # (it carries the device's exact action_step_size).
+                                if action.startswith("dial_rotate_"):
+                                    return
+                                convertedPayload["direction"] = "counter_clock_wise" if "down" in action else "clock_wise"
+                                convertedPayload["rotary_step_size"] = data.get("action_step_size", 8)
+                                # honour the device's own ramp time (seconds -> centiseconds)
+                                if data.get("action_transition_time") is not None:
+                                    convertedPayload["rotary_transition"] = max(1, int(round(data["action_transition_time"] * 100)))
+                                # the dial is a ZLLRelativeRotary sub-sensor that shares
+                                # this friendly_name with the switch; route the event to
+                                # it (its state holds the rotary keys).
+                                if device.type != "ZLLRelativeRotary":
+                                    for _s in bridgeConfig["sensors"].values():
+                                        if _s.protocol == "mqtt" and _s.protocol_cfg.get("friendly_name") == device_friendlyname and _s.type == "ZLLRelativeRotary":
+                                            device = _s
+                                            break
                         for key in convertedPayload.keys():
-                            if device.state[key] != convertedPayload[key]:
+                            if device.state.get(key) != convertedPayload[key]:
                                 device.dxState[key] = current_time
                         device.state.update(convertedPayload)
                         logging.debug(convertedPayload)
-                        if "buttonevent" in  convertedPayload and convertedPayload["buttonevent"] in [1001, 2001, 3001, 4001, 5001]:
+                        # Z2M already emits discrete *_hold repeats for these devices,
+                        # so don't also start our own long-press repeat thread.
+                        z2m_sends_hold = device.modelid in standardSensors and any(
+                            k.endswith("_hold") for k in standardSensors[device.modelid]["dataConversion"])
+                        if "buttonevent" in convertedPayload and convertedPayload["buttonevent"] in [1001, 2001, 3001, 4001, 5001] and not z2m_sends_hold:
                             Thread(target=longPressButton, args=[device, convertedPayload["buttonevent"]]).start()
                         rulesProcessor(device, current_time)
-                        checkBehaviorInstances(device)
+                        # Only run automations on a real input event, not on battery/
+                        # OTA-status messages — otherwise the stale buttonevent still in
+                        # state would re-fire the last button's scene on every message.
+                        if "buttonevent" in convertedPayload or "rotaryevent" in convertedPayload:
+                            checkBehaviorInstances(device)
                     elif device.getObjectPath()["resource"] == "lights":
                         state = {"reachable": True}
                         v2State = {}

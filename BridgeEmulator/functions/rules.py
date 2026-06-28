@@ -57,6 +57,26 @@ def checkRuleConditions(rule, device, current_time, ignore_ddx=False):
                 else:
                     ddx = int(condition["value"][2:4]) * 3600 + int(condition["value"][5:7]) * 60 + int(condition["value"][-2:])
                     ddx_sensor = url_pices
+            elif condition["operator"] == "not in":
+                periods = condition["value"].split('/')
+                if condition["value"][0] == "T":
+                    timeStart = datetime.strptime(periods[0], "T%H:%M:%S").time()
+                    timeEnd = datetime.strptime(periods[1], "T%H:%M:%S").time()
+                    now_time = datetime.now().time()
+                    if timeStart < timeEnd:
+                        if timeStart <= now_time <= timeEnd:
+                            return [False, 0]
+                    else:
+                        if timeStart <= now_time or now_time <= timeEnd:
+                            return [False, 0]
+            elif condition["operator"] in ("stable", "not stable"):
+                # 'stable'/'not stable' need historical sampling diyHue does not
+                # keep; conservatively treat as not-satisfied rather than firing.
+                return [False, 0]
+            else:
+                # Unknown/unsupported operator must NOT silently satisfy the rule.
+                logging.debug("rule " + rule.name + ": unsupported operator " + str(condition["operator"]))
+                return [False, 0]
         except Exception as e:
             logging.exception("rule " + rule.name + " failed, reason: " + str(type(e).__name__) + " " + str(e))
 
