@@ -20,6 +20,9 @@ class Group():
         self.action = {"on": False, "bri": 100, "hue": 0, "sat": 254, "effect": "none", "xy": [
             0.0, 0.0], "ct": 153, "alert": "none", "colormode": "xy"}
         self.sensors = []
+        # Non-light device children (switches, sensors) referenced by a room/zone.
+        # Stored as a copy so later mutation of the source list can't leak in.
+        self.device_children = list(data["device_children"]) if "device_children" in data else []
         self.type = data["type"] if "type" in data else "LightGroup"
         self.state = {"all_on": False, "any_on": False}
         self.dxState = {"all_on": None, "any_on": None}
@@ -218,13 +221,18 @@ class Group():
 
     def getV2Room(self):
         result = {"children": [], "services": []}
+        seen_children = set()
         for light in self.lights:
             if light():
-                result["children"].append({
-                    "rid": str(uuid.uuid5(
-                        uuid.NAMESPACE_URL, light().id_v2 + 'device')),
-                    "rtype": "device"
-                })
+                rid = light().getDevice()["id"]
+                if rid not in seen_children:
+                    seen_children.add(rid)
+                    result["children"].append({"rid": rid, "rtype": "device"})
+        # Non-light device children (switches/sensors), deduped against lights.
+        for rid in self.device_children:
+            if rid not in seen_children:
+                seen_children.add(rid)
+                result["children"].append({"rid": rid, "rtype": "device"})
 
         #result["grouped_services"].append({
         #    "rid": self.id_v2,
@@ -259,6 +267,8 @@ class Group():
                     "rid": light().id_v2,
                     "rtype": "light"
                 })
+        for rid in self.device_children:
+            result["children"].append({"rid": rid, "rtype": "device"})
 
         #result["grouped_services"].append({
         #    "rid": self.id_v2,
@@ -300,10 +310,13 @@ class Group():
         result["id_v1"] = "/groups/" + self.id_v1
         result["on"] = {"on": self.update_state()["any_on"]}
         result["type"] = "grouped_light"
-        if hasattr(self, "owner"):
-            result["owner"] = {"rid": self.owner.username, "rtype": "device"}
+        # Spec: a grouped_light is owned by its room/zone (group 0 -> bridge_home).
+        if self.type == "Room":
+            result["owner"] = {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + 'room')), "rtype": "room"}
+        elif self.id_v1 == "0":
+            result["owner"] = {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + 'bridge_home')), "rtype": "bridge_home"}
         else:
-            result["owner"] = {"rid": self.id_v2, "rtype": "device"}
+            result["owner"] = {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + 'zone')), "rtype": "zone"}
         result["signaling"] = {"signal_values": [
             "no_signal",
             "on_off"]}
@@ -315,7 +328,8 @@ class Group():
 
     def save(self):
         result = {"id_v2": self.id_v2, "name": self.name, "class": self.icon_class,
-                  "lights": [], "action": self.action, "type": self.type}
+                  "lights": [], "action": self.action, "type": self.type,
+                  "device_children": list(self.device_children)}
         if hasattr(self, "owner"):
             result["owner"] = self.owner.username
         for light in self.lights:

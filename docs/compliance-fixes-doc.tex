@@ -1,0 +1,672 @@
+\documentclass[11pt,a4paper]{article}
+
+% ----------------------------------------------------------------------------
+% Packages
+% ----------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+
+% ----------------------------------------------------------------------------
+% Colours & code style
+% ----------------------------------------------------------------------------
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codekw}{HTML}{0033B3}
+\definecolor{codestr}{HTML}{067D17}
+\definecolor{codecmt}{HTML}{8C8C8C}
+\definecolor{rule}{HTML}{1F4E79}
+\definecolor{accent}{HTML}{8A2BE2}
+
+\lstdefinestyle{py}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecmt}\itshape,
+  numberstyle=\tiny\color{codecmt},
+  numbers=left,
+  numbersep=8pt,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  framerule=0pt,
+  rulecolor=\color{codebg},
+  xleftmargin=12pt,
+  aboveskip=8pt,belowskip=8pt,
+  literate={->}{{$\rightarrow$}}1 {>=}{{$\geq$}}1 {<=}{{$\leq$}}1
+}
+\lstset{style=py}
+
+% ----------------------------------------------------------------------------
+% Teaching boxes
+% ----------------------------------------------------------------------------
+\newtcolorbox{keyidea}[1][]{colback=accent!6,colframe=accent!70,
+  fonttitle=\bfseries,title=Key idea,breakable,#1}
+\newtcolorbox{pitfall}[1][]{colback=red!4,colframe=red!55,
+  fonttitle=\bfseries,title=Common pitfall,breakable,#1}
+\newtcolorbox{specbox}[1][]{colback=rule!5,colframe=rule!70,
+  fonttitle=\bfseries,title=What the specification says,breakable,#1}
+\newtcolorbox{defbox}[2][]{colback=black!3,colframe=black!55,
+  fonttitle=\bfseries,title=Definition: #2,breakable,#1}
+
+\titleformat{\section}{\Large\bfseries\color{rule}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{rule!85}}{\thesubsection}{0.6em}{}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+% ----------------------------------------------------------------------------
+\title{\vspace{-1.2cm}\textbf{Engineering for Conformance}\\[2pt]
+  \large A Case Study in Bringing an Emulator into Line with a Real-World API\\[6pt]
+  \normalsize\textit{The Philips Hue API and the diyHue Bridge Emulator}}
+\author{Software Engineering Teaching Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This chapter is a worked example of a recurring task in professional software
+engineering: making one program faithfully imitate another whose behaviour is
+defined by a \emph{specification} rather than by shared source code. Our subject
+is \textsf{diyHue}, an open-source emulator of the Philips Hue smart-lighting
+bridge. We start from a real, automated measurement showing the emulator is only
+$\approx 33\%$ conformant with the Hue API, then repair nine subsystems and lift
+conformance to $100\%$ of an automated check suite (and a full test suite from
+$44$ passing / $38$ failing to $110$ passing / $0$ failing). Each repair is
+presented as a small, self-contained lesson: the rule being violated, the bug,
+the fix, and the general principle it illustrates. The recurring themes are
+\emph{input validation}, \emph{representation invariants}, \emph{total
+functions}, \emph{idempotent reconciliation}, and \emph{executable
+specifications}.
+\end{abstract}
+
+\begin{keyidea}
+A specification is a \emph{contract}. When you cannot see the other party's
+code, the contract is all you have. ``It works on my device'' is not the same
+as ``it obeys the contract'', and only the second one makes independent clients
+interoperate.
+\end{keyidea}
+
+\section*{Learning objectives}
+\addcontentsline{toc}{section}{Learning objectives}
+After studying this chapter you should be able to:
+\begin{itemize}[noitemsep]
+  \item explain the difference between a \emph{test} and a \emph{conformance
+        scorecard}, and why both are useful;
+  \item identify the classic defect classes---missing input validation,
+        broken representation invariants, partial (non-total) functions,
+        unsafe exception handling, and identity-vs-name confusion;
+  \item apply modular arithmetic and clamping to validate bounded inputs;
+  \item reason about ownership graphs and idempotent reconciliation;
+  \item recognise why catching \code{Exception} can hide control-flow bugs in
+        Python.
+\end{itemize}
+
+\tableofcontents
+\bigskip
+
+% ============================================================================
+\section{Background: two APIs and one emulator}
+% ============================================================================
+
+A Philips Hue \emph{bridge} is a small Linux device that speaks ZigBee to the
+lamps and HTTP to phones and home-automation software. Two generations of HTTP
+interface coexist:
+
+\begin{itemize}
+  \item the \textbf{v1 (legacy) REST API} under \code{/api/<user>/\ldots},
+        whose light state uses integer fields such as \code{bri}
+        ($1$--$254$), \code{ct} ($153$--$500$ mireds), and \code{hue}
+        ($0$--$65535$, wrapping); and
+  \item the \textbf{CLIP v2 API} under \code{/clip/v2/resource/\ldots}, a
+        resource-oriented model where each physical product is a
+        \code{device} resource that \emph{owns} a set of \emph{service}
+        resources (a \code{light}, a \code{button}, a \code{zigbee\_con\-nec\-tiv\-ity},
+        \ldots). Brightness here is a floating-point \emph{percentage}
+        ($0$--$100$).
+\end{itemize}
+
+\textsf{diyHue} re-implements both, plus a Server-Sent-Events (SSE) stream and a
+DTLS ``entertainment'' channel, on top of arbitrary hardware (ZigBee, MQTT,
+WLED, ESPHome, \ldots). Because real Hue apps were written and tested against a
+\emph{real} bridge, the emulator only works if it reproduces the real bridge's
+observable contract precisely.
+
+\begin{defbox}{conformance}
+\emph{Conformance} is the degree to which an implementation's observable
+behaviour matches a specification. It is observable: it says nothing about
+\emph{how} the program is built, only about what a client can see.
+\end{defbox}
+
+% ============================================================================
+\section{Method: measure before you mend}
+% ============================================================================
+
+Before changing code we built an automated \textbf{conformance scorecard}: a
+program that pokes the emulator and checks each spec rule, then prints a single
+weighted percentage. Crucially, a failing check does \emph{not} abort the run;
+it is recorded and reported, so the scorecard always produces a number you can
+watch rise as you work.
+
+\begin{keyidea}
+\textbf{Make the invisible measurable.} ``Improve compliance'' is not
+actionable. ``Raise the weighted conformance score from $33\%$ to $95\%$'' is.
+A good metric turns a vague goal into a gradient you can descend.
+\end{keyidea}
+
+Each check carries a severity weight ($\textsc{high}=3$, $\textsc{med}=2$,
+$\textsc{low}=1$), and the overall score is
+\[
+  \text{score} \;=\;
+  100 \times
+  \frac{\sum_{c\,\in\,\text{passing}} w_c}{\sum_{c\,\in\,\text{all}} w_c}.
+\]
+Weighting by severity means fixing one crash counts for more than polishing
+three cosmetic fields---the metric encodes our priorities.
+
+\begin{table}[h]
+\centering
+\caption{Conformance before and after the work in this chapter.}
+\begin{tabular}{lcc}
+\toprule
+ & \textbf{Before} & \textbf{After}\\
+\midrule
+Weighted conformance score & $32.8\%$ (grade E) & $\mathbf{100\%}$ (grade A)\\
+Scorecard checks passing    & $9/27$            & $\mathbf{27/27}$\\
+Full unit/contract suite    & $44$ pass / $38$ fail & $\mathbf{110}$ pass / $\mathbf{0}$ fail\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The scorecard is itself written with \textsf{pytest}. A non-conformant probe is
+marked \code{xfail} (``expected failure''), so the suite stays green while still
+recording the gap; as a bug is fixed the probe silently flips to a pass and the
+score rises with no edit to the check. A final \emph{regression gate} asserts
+the score never falls below a floor, so a future change that breaks conformance
+fails the build.
+
+\begin{defbox}{executable specification}
+An \emph{executable specification} is a checkable encoding of the rules a
+program must obey. Unlike prose, it cannot drift out of date silently: if the
+rule and the code disagree, the test run tells you.
+\end{defbox}
+
+% ============================================================================
+\section{Case studies}
+% ============================================================================
+
+We now walk through the nine repairs. Each is a miniature lesson; read the
+``Key idea'' boxes even if you skim the code.
+
+% ----------------------------------------------------------------------------
+\subsection{Input validation: clamping and wrapping}
+% ----------------------------------------------------------------------------
+
+\begin{specbox}
+A v1 light command must respect field ranges: \code{bri}$\in[1,254]$,
+\code{ct}$\in[153,500]$, \code{sat}$\in[0,254]$, and \code{hue} is a $16$-bit
+value that \emph{wraps} modulo $65536$. \code{bri}=$0$ is \emph{not} valid
+(``off'' is \code{on}=\textsf{false}, not brightness zero)~\cite{huedev,openhue}.
+\end{specbox}
+
+The emulator wrote whatever the client sent straight into its state, so
+\code{\{"bri":999\}} was stored verbatim. We added a single validation function
+applied on every direct state write:
+
+\begin{lstlisting}
+V1_STATE_RANGES = {"bri": (1, 254), "ct": (153, 500), "sat": (0, 254)}
+
+def clampV1State(state):
+    """Clamp/wrap v1 light-state values into spec-valid ranges, in place."""
+    for key, (lo, hi) in V1_STATE_RANGES.items():
+        if key in state and isinstance(state[key], (int, float)) \
+                and not isinstance(state[key], bool):
+            state[key] = max(lo, min(hi, int(state[key])))
+    if "hue" in state and isinstance(state["hue"], (int, float)):
+        state["hue"] = int(state["hue"]) % 65536      # wrap, do not clamp
+    ...
+    return state
+\end{lstlisting}
+
+Two details deserve attention. First, \code{hue} is \emph{wrapped}, not clamped:
+the original code did \code{state["hue"] -= 65535}, which is both off-by-one
+(the period is $65536$, not $65535$) and wrong for large increments. The
+correct operation is a single modulo:
+\[
+  \text{hue}' \;=\; (\text{hue} + \Delta) \bmod 65536 .
+\]
+Second, \code{bool} is a subclass of \code{int} in Python, so
+\code{isinstance(True, int)} is \code{True}~\cite{pystdtypes}; we exclude booleans explicitly so
+that \code{on=True} is never mistaken for a numeric field.
+
+\begin{pitfall}
+\textbf{Trusting the client.} Never assume input is in range just because a
+well-behaved client would send valid values. A different client---or a
+malicious one---will not. Validate at the boundary, once, in a single place you
+can point to.
+\end{pitfall}
+
+% ----------------------------------------------------------------------------
+\subsection{Representation invariants: the response envelope}
+% ----------------------------------------------------------------------------
+
+\begin{specbox}
+Every CLIP v2 response is an object with \emph{both} an \code{errors} array and
+a \code{data} array---even on error (then \code{data} is empty) and even on
+success (then \code{errors} is empty)~\cite{openhue,huev2}.
+\end{specbox}
+
+The emulator's \code{PUT} handler returned only \code{data}; its error path
+returned only \code{errors} and even \code{del}eted the \code{data} key. A
+client that unconditionally reads \code{response["data"]} would crash. The fix
+is to make the shape an \emph{invariant}---always present, regardless of
+outcome:
+
+\begin{lstlisting}
+# success
+response = {"errors": [], "data": [{"rid": resourceid, "rtype": resource}]}
+# error
+return {"errors": [{"description": f"...{resource}"}], "data": []}, 500
+\end{lstlisting}
+
+\begin{defbox}{representation invariant}
+A \emph{representation invariant} is a property that every value of a type must
+satisfy. ``A v2 response always has \code{errors} and \code{data} arrays'' is
+one. Enforcing invariants at the point of construction means clients never have
+to defend against malformed values.
+\end{defbox}
+
+A sibling bug lived in the ``get one button by id'' path, which returned
+\code{data:[object.getButtons()]}---a \emph{list inside a list}, because
+\code{getButtons()} already returns a list. The repair flattens the result and,
+because a single button is a sub-resource of a sensor device, resolves it by
+searching for the one matching id:
+
+\begin{lstlisting}
+if resource in ["button", "relative_rotary"]:
+    method = "getButtons" if resource == "button" else "getRotary"
+    items = [item for sensor in bridgeConfig["sensors"].values()
+             for item in getattr(sensor, method)()
+             if item["id"] == resourceid]
+    return {"errors": [], "data": items}
+\end{lstlisting}
+
+% ----------------------------------------------------------------------------
+\subsection{Data modelling: the device/service ownership graph}
+% ----------------------------------------------------------------------------
+
+The v2 model is a small graph: a \code{room} has \emph{children} (the devices in
+it) and \emph{services} (its \code{grouped\_light}); a \code{device} owns its
+services; a \code{grouped\_light} is owned by its room or zone~\cite{openhue,huev2}. Three bugs lived
+here.
+
+\paragraph{(a) Missing \texttt{owner}.} Every service and device must carry an
+\code{owner} reference \code{\{rid, rtype\}}. Devices omitted it, failing schema
+validation. We added it at each device's single construction point.
+
+\paragraph{(b) Non-light children were dropped.} A room could contain switches
+and sensors, but \code{getV2Room} only emitted its lights. We gave \code{Group}
+a \code{device\_children} list that is initialised from stored data (as a
+\emph{copy}, so later mutation of the source cannot leak in), rendered into the
+children array, de-duplicated against the lights, and persisted on save:
+
+\begin{lstlisting}
+self.device_children = list(data["device_children"]) \
+    if "device_children" in data else []
+...
+seen = set()
+for light in self.lights:
+    if light():
+        rid = light().getDevice()["id"]
+        if rid not in seen:
+            seen.add(rid); result["children"].append({"rid": rid, "rtype": "device"})
+for rid in self.device_children:            # non-light devices, deduped
+    if rid not in seen:
+        seen.add(rid); result["children"].append({"rid": rid, "rtype": "device"})
+\end{lstlisting}
+
+\paragraph{(c) Wrong owner on \texttt{grouped\_light}.} It claimed to be owned by
+a \emph{device}; the spec says a grouped light is owned by its room/zone (or, for
+group $0$, by \code{bridge\_home}). We compute the owner from the group's type.
+
+\begin{keyidea}
+\textbf{Model identities, not names.} A reference points at an \code{id}, never
+at a display name. Names change; identities do not. Half the bugs in this
+section are a node pointing at the wrong identity.
+\end{keyidea}
+
+% ----------------------------------------------------------------------------
+\subsection{Event semantics: batching, cascades, and an import trap}
+% ----------------------------------------------------------------------------
+
+\begin{specbox}
+A single light change is delivered as \emph{one} SSE event whose \code{data}
+array contains every affected resource: the light, its device, and the
+\code{grouped\_light} rollups for every owning room/zone and for
+\code{bridge\_home} (the ``all lights'' group)~\cite{whatwg-sse,huev2}.
+\end{specbox}
+
+The emulator emitted a \emph{separate} event per resource and never sent the
+group rollups, so a dashboard tracking a room's aggregate brightness silently
+went stale. We rewrote the emitter to build one batched event and append the
+rollups for every group containing the light.
+
+This subsection carries a subtle and very instructive Python lesson. To find the
+owning groups, the light needs the global configuration. A naive
+\code{import configManager} \emph{inside} the function re-runs that module's
+top-level code, which parses command-line arguments and calls
+\code{sys.exit()} when run under the test harness. That raises
+\code{SystemExit}---which is \textbf{not} a subclass of \code{Exception}~\cite{pyexc}:
+
+\[
+  \texttt{BaseException} \supset \{\texttt{SystemExit},\ \texttt{KeyboardInterrupt},\ \texttt{Exception} \supset \texttt{KeyError}, \ldots\}
+\]
+
+so a surrounding \code{except Exception} does \emph{not} catch it and the whole
+test crashes. The fix never triggers a fresh import; it reads the
+\emph{already-imported} module out of the module cache:
+
+\begin{lstlisting}
+import sys
+groups = {}
+cfgMod = sys.modules.get("configManager")   # do NOT `import` here
+if cfgMod is not None:
+    try:
+        groups = cfgMod.bridgeConfig.yaml_config.get("groups", {})
+    except Exception:
+        groups = {}
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{\code{import} runs code.} In Python, importing a module executes its
+top level. Importing for a side effect deep inside a hot function can re-run
+that code in a surprising context. And remember: \code{except Exception} does
+\emph{not} catch \code{SystemExit} or \code{KeyboardInterrupt}---those are
+\code{BaseException}s by design~\cite{pyexc}, so a stray \code{sys.exit()} sails right past
+your handler.
+\end{pitfall}
+
+% ----------------------------------------------------------------------------
+\subsection{Total functions: the rules-engine fall-through}
+% ----------------------------------------------------------------------------
+
+The v1 rules engine evaluates conditions of the form
+\code{\{address, operator, value\}}. The dispatch was a chain of
+\code{if/elif} on the operator, with \emph{no final \code{else}}. An operator
+the engine did not recognise---\code{"not in"}, \code{"stable"}---matched no
+branch, so the loop simply fell through and the condition was treated as
+\emph{satisfied}. A rule that should never fire could therefore fire.
+
+\begin{keyidea}
+\textbf{Make dispatch total.} A function that switches on a value should handle
+\emph{every} value, including the unexpected ones. The safe default for an
+unknown operator is ``condition not met'', never ``silently true''. In practice
+this means: always write the final \code{else}.
+\end{keyidea}
+
+\begin{lstlisting}
+elif condition["operator"] == "not in":
+    ...                              # genuinely evaluate the time window
+elif condition["operator"] in ("stable", "not stable"):
+    return [False, 0]                # cannot evaluate -> do not fire
+else:
+    logging.debug("unsupported operator " + str(condition["operator"]))
+    return [False, 0]                # unknown -> safe default
+\end{lstlisting}
+
+% ----------------------------------------------------------------------------
+\subsection{Robustness: a crash hiding behind a missing key}
+% ----------------------------------------------------------------------------
+
+Creating a v2 \code{behavior\_instance} with a perfectly valid payload returned
+HTTP $500$. The cause was one line that assumed an optional field always
+exists:
+\begin{lstlisting}
+for resource in self.configuration["where"]:        # KeyError if absent
+\end{lstlisting}
+The repair is a one-character class of fix---ask for the key \emph{defensively}:
+\begin{lstlisting}
+for resource in self.configuration.get("where", []):
+\end{lstlisting}
+
+\begin{pitfall}
+\code{d[k]} demands that \code{k} exists; \code{d.get(k, default)} tolerates its
+absence. Use indexing only when absence is genuinely a bug worth crashing for.
+For optional fields, supply a default.
+\end{pitfall}
+
+% ----------------------------------------------------------------------------
+\subsection{Resource management: rate limiting}
+% ----------------------------------------------------------------------------
+
+\begin{specbox}
+A real bridge processes only about \emph{ten} light commands per second; beyond
+that it returns HTTP $429$ (``Too Many Requests'')~\cite{rfc6585,huedev}. Apps are written to expect
+this back-pressure.
+\end{specbox}
+
+The emulator applied every command immediately, so a client tuned to the real
+bridge could overwhelm slow hardware. We added a \emph{sliding-window} limiter:
+keep the timestamps of recent commands, drop those older than one second, and
+reject once the window is full.
+
+\begin{lstlisting}
+_RATE_LIMITS = {"light": 10}
+_rate_state = {}
+
+def rateLimited(resource):
+    limit = _RATE_LIMITS.get(resource)
+    if not limit:
+        return False
+    now = monotonic()
+    window = _rate_state.setdefault(resource, [])
+    window[:] = [t for t in window if t > now - 1.0]   # forget old events
+    if len(window) >= limit:
+        return True
+    window.append(now)
+    return False
+\end{lstlisting}
+
+\begin{defbox}{sliding-window rate limit}
+A \emph{sliding-window} limiter permits at most $N$ events in any trailing time
+window of length $T$. It is implemented by remembering recent event times and
+discarding those older than $T$ before each decision. Note the use of a
+\emph{monotonic} clock, which never jumps backwards when the system time is~\cite{pytime}
+adjusted.
+\end{defbox}
+
+% ----------------------------------------------------------------------------
+\subsection{Idempotent reconciliation: de-duplicating MQTT sensors}
+% ----------------------------------------------------------------------------
+
+When a ZigBee device is renamed in the Zigbee2MQTT layer, the bridge re-announces
+it under a new friendly name. The emulator keyed sensors by \emph{name}, so a
+rename created a \emph{second} copy instead of updating the first---and the two
+copies fought over the device. The real identity of a ZigBee device is not its
+name but its \code{ieeeAddr} (its hardware address). The fix groups sensors by
+that stable key, keeps exactly one per logical type, and renames in place:
+
+\begin{lstlisting}
+def getSensorsByIeeeAddr(ieeeAddr):
+    return [s for s in bridgeConfig["sensors"].values()
+            if getattr(s, "protocol", None) == "mqtt"
+            and s.protocol_cfg.get("ieeeAddr") == ieeeAddr]
+\end{lstlisting}
+
+\begin{keyidea}
+\textbf{Reconcile, don't duplicate.} Processing the same announcement twice
+should leave the system in the same state as processing it once. This property
+is called \emph{idempotence}, and the way to get it is to key your records by a
+stable identity and \emph{update} rather than \emph{insert}.
+\end{keyidea}
+
+% ----------------------------------------------------------------------------
+\subsection{Schema-driven dispatch: the tap-dial automation}
+% ----------------------------------------------------------------------------
+
+The most involved repair re-implemented the automation engine for the RDM002
+``tap dial'' (four buttons plus a rotary). The button-event integer encodes both
+\emph{which} button and \emph{what} happened:
+\[
+  \underbrace{1}_{\text{button }1}\,\underbrace{002}_{\text{short release}}
+\]
+i.e. \code{button = event // 1000} and \code{action = event \% 1000}. We map the
+trailing digit to a named action through a small table---clearer and more
+total than a chain of \code{if}s:
+
+\begin{lstlisting}
+BUTTON_ACTIONS = {0: "on_initial_press", 1: "on_repeat",
+                  2: "on_short_release", 3: "on_long_press"}
+...
+buttonKey = "button" + str(buttonevent // 1000)
+actionKey = BUTTON_ACTIONS.get(buttonevent % 1000)
+\end{lstlisting}
+
+The rotary dial is a separate logical sensor whose automation is configured on
+its \emph{parent} switch; matching therefore checks both the device's own id and
+its \code{parent\_id\_v2}. The new schema lives alongside the legacy one (we
+fall back to the old format when the new keys are absent), so existing stored
+automations keep working---a small but important act of
+\emph{backward compatibility}.
+
+% ============================================================================
+\section{Verification: the scorecard as a safety net}
+% ============================================================================
+
+Every repair was confirmed by re-running the scorecard and watching the number
+climb: $32.8\% \to 62.3\% \to 96.7\% \to 100\%$. Because the checks are
+executable, they double as regression protection: the gate
+\code{test\_scorecard\_meets\_baseline} now fails the build if conformance drops
+below $95\%$.
+
+\begin{keyidea}
+\textbf{A fix without a test is a rumour.} Each defect in this chapter is now
+pinned by a check that would have caught it. The scorecard is not scaffolding to
+be discarded---it is the executable definition of ``done''.
+\end{keyidea}
+
+% ============================================================================
+\section{Recurring principles}
+% ============================================================================
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Measure first.} Turn ``be more compliant'' into a number, then
+        make the number go up.
+  \item \textbf{Validate at the boundary.} Clamp and wrap untrusted input once,
+        in one place.
+  \item \textbf{Enforce invariants at construction.} If every response has the
+        same shape, no client has to defend against malformed ones.
+  \item \textbf{Make functions total.} Handle every case; the safe default for
+        the unknown case is rarely ``succeed''.
+  \item \textbf{Key by identity, not by name.} Stable identifiers make
+        reconciliation idempotent.
+  \item \textbf{Know your language.} \code{import} runs code; \code{SystemExit}
+        is not an \code{Exception}; \code{bool} is an \code{int}.
+\end{enumerate}
+
+% ============================================================================
+\section*{Exercises}
+% ============================================================================
+\addcontentsline{toc}{section}{Exercises}
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{(Wrapping.)} Show that \code{(hue + }$\Delta$\code{) \% 65536}
+        gives the correct result for $\Delta = -90000$, whereas a single
+        \code{+= 65536} correction does not. For which range of $\Delta$ does
+        the single-correction approach work?
+  \item \textbf{(Invariants.)} A teammate proposes returning bare \code{[]} for
+        an empty collection instead of \code{\{"errors":[],"data":[]\}}.
+        Give a concrete client that breaks, and state the invariant being
+        violated.
+  \item \textbf{(Totality.)} The rules engine fell through on unknown operators.
+        Write a property-based test that feeds random operator strings and
+        asserts the condition is never reported as satisfied unless the operator
+        is one of the supported set.
+  \item \textbf{(Rate limiting.)} The limiter uses \code{monotonic()} rather
+        than \code{time()}. Construct a scenario (an NTP step, a daylight-saving
+        change) where using wall-clock time would let a burst through or block a
+        legitimate command.
+  \item \textbf{(Idempotence.)} Prove that processing the same
+        \code{bridge/devices} announcement twice leaves the sensor table
+        identical to processing it once, given the de-duplication rule
+        ``one sensor per type, keyed by \code{ieeeAddr}''.
+  \item \textbf{(Design.)} The tap-dial decodes \code{event // 1000} and
+        \code{event \% 1000}. What goes wrong if a future device emits button
+        index $10$? Propose an encoding that does not have this ceiling and
+        discuss its compatibility cost.
+\end{enumerate}
+
+% ============================================================================
+\begin{thebibliography}{9}
+\addcontentsline{toc}{section}{References}
+
+\bibitem{huedev} Signify / Philips Hue. \emph{Hue Developer Documentation --- CLIP
+API v2 and legacy API, core concepts (resource model, rate limits, light state
+ranges)}. \url{https://developers.meethue.com/develop/hue-api-v2/}. (Access
+requires a free developer account; the machine-readable transcription in
+\cite{openhue} mirrors its field names and enums.)
+
+\bibitem{openhue} OpenHue. \emph{openhue-api --- an OpenAPI 3 specification of the
+Philips Hue CLIP v2 API}. \url{https://github.com/openhue/openhue-api}. Source of
+the device/service composition model, the \texttt{\{errors,data\}} envelope, and
+the \texttt{dimming.brightness} $0$--$100$ percentage.
+
+\bibitem{rfc6585} R. Fielding and M. Nottingham. \emph{RFC 6585: Additional HTTP
+Status Codes}. IETF, April 2012. \url{https://datatracker.ietf.org/doc/html/rfc6585}.
+Defines \texttt{429 Too Many Requests} and the \texttt{Retry-After} header.
+
+\bibitem{whatwg-sse} WHATWG. \emph{HTML Living Standard, \S9.2 Server-sent events}.
+\url{https://html.spec.whatwg.org/multipage/server-sent-events.html}. The
+\texttt{text/event-stream} wire format (\texttt{id:}/\texttt{data:} fields) and
+the \texttt{EventSource} API.
+
+\bibitem{pyexc} Python Software Foundation. \emph{Python Language Reference ---
+Built-in Exceptions: the exception hierarchy}.
+\url{https://docs.python.org/3/library/exceptions.html}. \texttt{SystemExit} and
+\texttt{KeyboardInterrupt} derive from \texttt{BaseException}, not
+\texttt{Exception}, so \texttt{except Exception} does not catch them.
+
+\bibitem{pystdtypes} Python Software Foundation. \emph{The Python Standard Library
+--- Numeric Types and Boolean Values}.
+\url{https://docs.python.org/3/library/stdtypes.html\#boolean-type-bool}.
+\texttt{bool} is a subclass of \texttt{int} (\texttt{True}=1, \texttt{False}=0;
+see also PEP 285).
+
+\bibitem{pytime} Python Software Foundation. \emph{The Python Standard Library ---
+\texttt{time.monotonic()}}. \url{https://docs.python.org/3/library/time.html\#time.monotonic}.
+A clock that cannot go backwards and is unaffected by system-clock adjustments
+(rationale in PEP 418).
+
+\bibitem{diyhue} The diyHue project. \emph{diyHue --- a Philips Hue bridge
+emulator (source repository)}. \url{https://github.com/diyhue/diyHue}. Primary
+source for the emulator behaviour discussed here; specific defects cite
+\texttt{BridgeEmulator/\ldots} by file and line.
+
+\bibitem{companion} Companion artifacts in this repository:
+\texttt{docs/spec-compliance-audit.md} (the full defect inventory),
+\texttt{docs/real-bridge-research.md} (measured behaviour of the genuine BSB002
+bridge), and \texttt{tests/test\_spec\_compliance.py} (the executable scorecard).
+
+\end{thebibliography}
+
+\vfill
+\noindent\rule{\linewidth}{0.4pt}\\
+\footnotesize These notes accompany the change set on the
+\texttt{spec-compliance-fixes} branch of \textsf{diyHue}. The companion
+documents \texttt{spec-compliance-audit.md} (the full defect list) and
+\texttt{real-bridge-research.md} (how the real bridge behaves) provide the
+underlying evidence.
+
+\end{document}

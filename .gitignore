@@ -24,3 +24,9 @@ BridgeEmulator/cert.pem
 *.css
 *.webp
 BridgeEmulator/flaskUI/templates/index.html
+
+# Local Claude Code settings (not shared)
+.claude/
+
+# Generated compliance scorecard report
+tests/compliance_report.txt

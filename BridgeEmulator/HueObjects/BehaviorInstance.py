@@ -48,7 +48,7 @@ class BehaviorInstance():
         if self.name != None:
             result["metadata"]["name"] = self.name
 
-        for resource in self.configuration["where"]:
+        for resource in self.configuration.get("where", []):
             result["dependees"].append({"level": "critical",
                                         "target": {
                                             "rid": resource[list(resource.keys())[0]]["rid"],

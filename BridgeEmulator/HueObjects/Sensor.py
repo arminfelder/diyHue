@@ -222,6 +222,17 @@ class Sensor():
                 "rid": str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + 'zigbee_connectivity')),
                 "rtype": "zigbee_connectivity"
                 }]
+            # One physical RDM002 = switch + dial: expose the sibling rotary's
+            # relative_rotary service on this single device (per CLIP v2 spec).
+            import sys as _sys
+            rotaryRid = str(uuid.uuid5(uuid.NAMESPACE_URL, self.id_v2 + 'relative_rotary'))
+            _cfgMod = _sys.modules.get("configManager")
+            if _cfgMod is not None:
+                for _s in _cfgMod.bridgeConfig.yaml_config.get("sensors", {}).values():
+                    if getattr(_s, "type", None) == "ZLLRelativeRotary" and getattr(_s, "parent_id_v2", None) == self.id_v2:
+                        rotaryRid = str(uuid.uuid5(uuid.NAMESPACE_URL, _s.id_v2 + 'relative_rotary'))
+                        break
+            result["services"].append({"rid": rotaryRid, "rtype": "relative_rotary"})
             result["type"] = "device"
         elif self.modelid == "RDM002" and self.type == "ZLLRelativeRotary":
             result = {"id": self.id_v2, "id_v1": "/sensors/" + self.id_v1, "type": "device"}
@@ -249,6 +260,8 @@ class Sensor():
                 "rtype": "zigbee_connectivity"
                 }]
             result["type"] = "device"
+        if result is not None:
+            result.setdefault("owner", {"rid": result["id"], "rtype": "device"})
         return result
 
     def getMotion(self):
@@ -382,7 +395,7 @@ class Sensor():
                     "updated": self.state["lastupdated"],
                     "action": "start" if self.state["rotaryevent"] == 1 else "repeat",
                     "rotation": {
-                        "direction": "right",#self.state["direction"],
+                        "direction": "counter_clock_wise" if self.state.get("direction") in ("left", "counter_clock_wise") else "clock_wise",
                         "steps": self.state["expectedrotation"],
                         "duration": self.state["expectedeventduration"]
                     }

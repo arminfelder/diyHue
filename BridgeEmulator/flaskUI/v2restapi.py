@@ -9,7 +9,7 @@ from flask_restful import Resource
 from flask import request
 from services.entertainment import entertainmentService
 from threading import Thread
-from time import sleep
+from time import sleep, monotonic
 from functions.core import nextFreeId
 from datetime import datetime, timezone
 from functions.scripts import behaviorScripts
@@ -23,6 +23,24 @@ bridgeConfig = configManager.bridgeConfig.yaml_config
 v2Resources = {"light": {}, "scene": {}, "smart_scene": {}, "grouped_light": {}, "room": {}, "zone": {
 }, "entertainment": {}, "entertainment_configuration": {}, "zigbee_connectivity": {}, "zigbee_device_discovery": {}, "device": {}, "device_power": {},
 "geofence_client": {}, "motion": {}, "light_level": {}, "temperature": {}, "relative_rotary": {}, "button": {}}
+
+
+# Real bridge throttles ~10 light commands/sec; exceed → HTTP 429.
+_RATE_LIMITS = {"light": 10}
+_rate_state = {}
+
+
+def rateLimited(resource):
+    limit = _RATE_LIMITS.get(resource)
+    if not limit:
+        return False
+    now = monotonic()
+    window = _rate_state.setdefault(resource, [])
+    window[:] = [t for t in window if t > now - 1.0]
+    if len(window) >= limit:
+        return True
+    window.append(now)
+    return False
 
 
 def getObject(element, v2uuid):
@@ -191,6 +209,7 @@ def v2BridgeDevice():
     bridge_id = config["bridgeid"]
     result = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, bridge_id + 'device')), "type": "device"}
     result["id_v1"] = ""
+    result["owner"] = {"rid": str(uuid.uuid5(uuid.NAMESPACE_URL, bridge_id + 'device')), "rtype": "device"}
     result["metadata"] = {"archetype": "bridge_v2", "name": config["name"]}
     result["identify"] = {}
     result["product_data"] = {
@@ -426,7 +445,7 @@ class ClipV2Resource(Resource):
                     response["data"].append(lightlevel)
         else:
             response["errors"].append({"description": "Not Found"})
-            del response["data"]
+            response["data"] = []
 
         return response
 
@@ -568,6 +587,14 @@ class ClipV2ResourceId(Resource):
         authorisation = authorizeV2(request.headers)
         if "user" not in authorisation:
             return "", 403
+        # button/relative_rotary are sub-resources of a sensor device: resolve
+        # the single matching item and return it as a flat data[] (not nested).
+        if resource in ["button", "relative_rotary"]:
+            method = "getButtons" if resource == "button" else "getRotary"
+            items = [item for sensor in bridgeConfig["sensors"].values()
+                     for item in getattr(sensor, method)()
+                     if item["id"] == resourceid]
+            return {"errors": [], "data": items}
         object = getObject(resource, resourceid)
         if not object:
             return {"errors": [], "data": []}
@@ -610,6 +637,8 @@ class ClipV2ResourceId(Resource):
         authorisation = authorizeV2(request.headers)
         if "user" not in authorisation:
             return "", 403
+        if rateLimited(resource):
+            return {"errors": [{"description": "rate limit exceeded"}], "data": []}, 429
         putDict = request.get_json(force=True)
         logging.info(putDict)
         object = getObject(resource, resourceid)
@@ -672,7 +701,11 @@ class ClipV2ResourceId(Resource):
                 for children in putDict["children"]:
                     obj = getObject(
                         children["rtype"], children["rid"])
-                    object.add_light(obj)
+                    if children["rtype"] == "light" or (obj and obj.getObjectPath()["resource"] == "lights"):
+                        object.add_light(obj)
+                    elif children["rid"] not in object.device_children:
+                        # non-light device child (switch/sensor)
+                        object.device_children.append(children["rid"])
             object.update_attr(v1Api)
         elif resource == 'geofence_client':
             attrs = {}
@@ -715,10 +748,11 @@ class ClipV2ResourceId(Resource):
             return {
                 "errors": [{
                     "description": f"Resource type not supported: {resource}"
-                }]
+                }],
+                "data": []
             }, 500
 
-        response = {"data": [{
+        response = {"errors": [], "data": [{
             "rid": resourceid,
             "rtype": resource
         }]}
@@ -738,7 +772,7 @@ class ClipV2ResourceId(Resource):
         else:
             del bridgeConfig[resource][resourceid]
 
-        response = {"data": [{
+        response = {"errors": [], "data": [{
             "rid": resourceid,
             "rtype": resource
         }]}

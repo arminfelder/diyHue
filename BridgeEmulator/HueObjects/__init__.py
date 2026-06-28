@@ -43,6 +43,24 @@ def v2StateToV1(v2State):
 def genV2Uuid():
     return str(uuid.uuid4())
 
+
+# Valid v1 state ranges (per Hue API): inclusive min/max. hue wraps mod 65536.
+V1_STATE_RANGES = {"bri": (1, 254), "ct": (153, 500), "sat": (0, 254)}
+
+
+def clampV1State(state):
+    """Clamp/wrap v1 light-state values into their spec-valid ranges, in place."""
+    for key, (lo, hi) in V1_STATE_RANGES.items():
+        if key in state and isinstance(state[key], (int, float)) and not isinstance(state[key], bool):
+            state[key] = max(lo, min(hi, int(state[key])))
+    if "hue" in state and isinstance(state["hue"], (int, float)) and not isinstance(state["hue"], bool):
+        state["hue"] = int(state["hue"]) % 65536
+    if "xy" in state and isinstance(state["xy"], (list, tuple)) and len(state["xy"]) == 2:
+        state["xy"] = [max(0.0, min(1.0, float(state["xy"][0]))),
+                       max(0.0, min(1.0, float(state["xy"][1])))]
+    return state
+
+
 def generate_unique_id():
     rand_bytes = [random.randrange(0, 256) for _ in range(3)]
     return "00:17:88:01:00:%02x:%02x:%02x-0b" % (rand_bytes[0], rand_bytes[1], rand_bytes[2])
@@ -126,11 +144,7 @@ def incProcess(state, data):
         del data["ct_inc"]
         data["ct"] = state["ct"]
     elif "hue_inc" in data:
-        state["hue"] += data["hue_inc"]
-        if state["hue"] > 65535:
-            state["hue"] -= 65535
-        elif state["hue"] < 0:
-            state["hue"] += 65535
+        state["hue"] = (state["hue"] + data["hue_inc"]) % 65536
         del data["hue_inc"]
         data["hue"] = state["hue"]
     elif "sat_inc" in data:
@@ -141,5 +155,12 @@ def incProcess(state, data):
             state["sat"] = 1
         del data["sat_inc"]
         data["sat"] = state["sat"]
+    elif "xy_inc" in data:
+        base = state["xy"] if "xy" in state and isinstance(state["xy"], (list, tuple)) else [0.0, 0.0]
+        x = max(0.0, min(1.0, base[0] + data["xy_inc"][0]))
+        y = max(0.0, min(1.0, base[1] + data["xy_inc"][1]))
+        state["xy"] = [x, y]
+        del data["xy_inc"]
+        data["xy"] = state["xy"]
 
     return data
