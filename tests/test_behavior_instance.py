@@ -67,10 +67,10 @@ def _make_sensor(sensor_type, id_v2=None, parent_id_v2=None, buttonevent=None, d
     return s
 
 
-def _make_group(group_id_v2=None, any_on=False):
+def _make_group(group_id_v2=None, any_on=False, avr_bri=100):
     g = MagicMock()
     g.id_v2 = group_id_v2 or str(uuid.uuid4())
-    g.update_state.return_value = {"any_on": any_on, "all_on": any_on, "avr_bri": 100}
+    g.update_state.return_value = {"any_on": any_on, "all_on": any_on, "avr_bri": avr_bri}
     g.setV1Action = MagicMock()
     return g
 
@@ -152,7 +152,8 @@ class TestCheckBehaviorInstancesSwitch:
         where = [{"group": {"rid": room_rid, "rtype": "room"}}]
         button_key = f"button{buttonevent // 1000}"
         last = buttonevent % 1000
-        action_map = {0: "on_initial_press", 1: "on_repeat", 2: "on_short_release", 3: "on_long_press"}
+        # Z2M buttonevent last digit -> per-button action (RDM002 spec mapping)
+        action_map = {0: "on_initial_press", 1: "on_long_press", 2: "on_short_release", 3: "on_long_release"}
         action_key = action_map[last]
 
         instance = _make_instance(device_id, {button_key: {"where": where, action_key: action_cfg}})
@@ -253,15 +254,20 @@ class TestCheckBehaviorInstancesSwitch:
 # ---------------------------------------------------------------------------
 
 class TestCheckBehaviorInstancesRotary:
-    def _setup(self, direction):
+    def _setup(self, direction, step=8, any_on=True, avr_bri=100, extra_cfg=None):
         group_id_v2 = str(uuid.uuid4())
-        group = _make_group(group_id_v2)
+        group = _make_group(group_id_v2, any_on=any_on, avr_bri=avr_bri)
         room_rid = _make_room_rid(group_id_v2)
 
         switch_id_v2 = str(uuid.uuid4())
         rotary = _make_sensor("ZLLRelativeRotary", parent_id_v2=switch_id_v2, direction=direction)
+        rotary.state["rotary_step_size"] = step
 
-        rotary_cfg = {"where": [{"group": {"rid": room_rid, "rtype": "room"}}]}
+        rotary_cfg = {"where": [{"group": {"rid": room_rid, "rtype": "room"}}],
+                      "on_dim_off": {"action": "all_off"},
+                      "on_dim_on": {"recall_single": [{"action": "last_on"}]}}
+        if extra_cfg:
+            rotary_cfg.update(extra_cfg)
         instance = _make_instance(switch_id_v2, {"rotary": rotary_cfg})
 
         cfg = _setup_stubs(bi={"inst1": instance}, groups={"1": group})
@@ -269,19 +275,46 @@ class TestCheckBehaviorInstancesRotary:
         bi_mod.findGroup = lambda rid, rtype: group
         return bi_mod, rotary, group
 
-    def test_right_dims_up(self):
-        bi_mod, rotary, group = self._setup("right")
+    def test_dim_up_steps_by_device_step(self):
+        """clock_wise dims up by the device's rotary_step_size (action_step_size)."""
+        bi_mod, rotary, group = self._setup("clock_wise", step=44, any_on=True)
         bi_mod.checkBehaviorInstances(rotary)
-        group.setV1Action.assert_called_with({"bri_inc": +30})
+        group.setV1Action.assert_called_with({"bri_inc": +44, "transitiontime": 4})
 
-    def test_left_dims_down(self):
-        bi_mod, rotary, group = self._setup("left")
+    def test_dim_down_steps_by_device_step(self):
+        bi_mod, rotary, group = self._setup("counter_clock_wise", step=8, any_on=True, avr_bri=80)
         bi_mod.checkBehaviorInstances(rotary)
-        group.setV1Action.assert_called_with({"bri_inc": -30})
+        group.setV1Action.assert_called_with({"bri_inc": -8, "transitiontime": 4})
+
+    def test_dim_down_holds_minimum_before_off(self):
+        """At low-but-not-min brightness, keep dimming (don't turn off yet)."""
+        bi_mod, rotary, group = self._setup("counter_clock_wise", step=8, any_on=True, avr_bri=10)
+        bi_mod.checkBehaviorInstances(rotary)
+        group.setV1Action.assert_called_with({"bri_inc": -8, "transitiontime": 4})
+
+    def test_dim_down_at_minimum_turns_off(self):
+        """Only once at the true minimum does on_dim_off fire (all_off)."""
+        bi_mod, rotary, group = self._setup("counter_clock_wise", step=8, any_on=True, avr_bri=1)
+        bi_mod.checkBehaviorInstances(rotary)
+        group.setV1Action.assert_called_with({"on": False})
+
+    def test_dim_up_from_off_recalls_last_on(self):
+        """clock_wise from an off group restores the last on-state (not min)."""
+        bi_mod, rotary, group = self._setup("clock_wise", any_on=False)
+        bi_mod.checkBehaviorInstances(rotary)
+        group.setV1Action.assert_called_with({"on": True, "transitiontime": 4})
+
+    def test_uses_device_transition_time(self):
+        """The per-detent transition follows the device's rotary_transition."""
+        bi_mod, rotary, group = self._setup("clock_wise", step=8, any_on=True)
+        rotary.state["rotary_transition"] = 5          # 0.05 s from action_transition_time
+        bi_mod.checkBehaviorInstances(rotary)
+        group.setV1Action.assert_called_with({"bri_inc": +8, "transitiontime": 5})
 
     def test_matches_via_parent_id_v2(self):
-        """Instance configured on switch id_v2; rotary has that as parent_id_v2."""
-        bi_mod, rotary, group = self._setup("right")
+        """Instance configured on switch id_v2; rotary has it as parent_id_v2
+        (set on pairing or back-filled from uniqueid at config load)."""
+        bi_mod, rotary, group = self._setup("clock_wise", step=20, any_on=True)
         bi_mod.checkBehaviorInstances(rotary)
         assert group.setV1Action.called
 

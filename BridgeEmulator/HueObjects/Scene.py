@@ -71,7 +71,8 @@ class Scene():
                 return
 
         queueState = {}
-        self.status = data["recall"]["action"]
+        # callers (e.g. behavior_instance.callScene) may activate with no "recall"
+        self.status = data["recall"]["action"] if "recall" in data else "static"
         for light, state in self.lightstates.items():
             logging.debug(state)
             light.state.update(state)
