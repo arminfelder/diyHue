@@ -295,6 +295,37 @@ def on_state_update(msg):
     logging.debug(json.dumps(data, indent=4))
 
 # on_message handler (linked to client below)
+def getSensorsByIeeeAddr(ieeeAddr):
+    """All mqtt sensors that share a Zigbee ieee address (one physical device)."""
+    result = []
+    for sensor in bridgeConfig["sensors"].values():
+        if getattr(sensor, "protocol", None) == "mqtt" and \
+                sensor.protocol_cfg.get("ieeeAddr") == ieeeAddr:
+            result.append(sensor)
+    return result
+
+
+def renameAndDedupSensors(sensors, friendly_name):
+    """
+    Rename every sensor of a physical device to `friendly_name` and keep only
+    one sensor per type (a renamed Z2M device can otherwise leave stale
+    duplicates registered under the old friendly_name).
+    """
+    byType = {}
+    for sensor in sensors:
+        byType.setdefault(sensor.type, []).append(sensor)
+    for group in byType.values():
+        keeper = next((s for s in group
+                       if s.protocol_cfg.get("friendly_name") == friendly_name), group[0])
+        for sensor in group:
+            if sensor is not keeper:
+                for sid, obj in list(bridgeConfig["sensors"].items()):
+                    if obj is sensor:
+                        del bridgeConfig["sensors"][sid]
+        keeper.name = friendly_name
+        keeper.protocol_cfg["friendly_name"] = friendly_name
+
+
 def on_message(client, userdata, msg):
     if bridgeConfig["config"]["mqtt"]["enabled"]:
         try:
@@ -307,7 +338,12 @@ def on_message(client, userdata, msg):
             elif msg.topic == "zigbee2mqtt/bridge/devices":
                 for key in data:
                     if "model_id" in key and (key["model_id"] in standardSensors or key["model_id"] in motionSensors): # Sensor is supported
-                        if getObject(key["friendly_name"]) == False: ## Add the new sensor
+                        existingByIeee = getSensorsByIeeeAddr(key["ieee_address"]) if "ieee_address" in key else []
+                        if existingByIeee:
+                            # ieee already registered (e.g. user renamed in Z2M):
+                            # rename in place and dedupe rather than adding again.
+                            renameAndDedupSensors(existingByIeee, key["friendly_name"])
+                        elif getObject(key["friendly_name"]) == False: ## Add the new sensor
                             logging.info("MQTT: Add new mqtt sensor " + key["friendly_name"])
                             if key["model_id"] in standardSensors:
                                 for sensor_type in sensorTypes[key["model_id"]].keys():
